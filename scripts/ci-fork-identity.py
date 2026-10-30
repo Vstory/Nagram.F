@@ -9,7 +9,8 @@
 
 改七类：
   1. 包名 / 显示名（与上游原版并存安装）
-  2. jni.c 的 verifySign 闸门 —— 不删则自签包启动即 JNI_ERR（README 第 2 步强制要求）
+  2. native 层签名指纹 —— 内置的是上游发布证书的 SHA1，自签包会 JNI_ERR；换成我们自己的证书
+     SHA1 而不是删掉校验（删掉等于把「防重打包」也一起扔了，任何人都能改我们的包重签发布）
   3. 版本号（APP_VERSION_CODE / APP_VERSION_NAME，来源 gradle.properties）
   4. 隐藏功能默认开启（否则「强制复制」那两行在设置页根本不存在）
   5. 调试菜单：长按一次直接弹出（不再要求第 2 次），并去掉「发生错误」提示
@@ -37,6 +38,10 @@ DEFAULT_LABEL = "Nagram.F"
 SETTINGS = "TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java"
 NACONFIG = "TMessagesProj/src/main/kotlin/xyz/nextalone/nagram/NaConfig.kt"
 JNIC = "TMessagesProj/jni/jni.c"
+INTEGRITY = "TMessagesProj/jni/integrity/integrity.cpp"
+# tokens/Signing/Vstory.jks 证书的 SHA1（大写无冒号）
+FORK_CERT_SHA1 = "92A37D7C19D696CA2645D00A11C507358805B2D6"
+UPSTREAM_CERT_SHA1 = "3A0F57FE06485D0B90D0ACD990E3A30328E3988D"
 GRADLE_PROPS = "gradle.properties"
 APP_GRADLE = "TMessagesProj/build.gradle"
 STRINGS = "TMessagesProj/src/main/res/values/strings.xml"
@@ -112,11 +117,8 @@ LONG_PRESS_NEW = """        versionView.setOnLongClickListener(v -> {
             return true;
         });"""
 
-VERIFY_SIGN_OLD = """    if (verifySign(env) != JNI_OK) {
-        return JNI_ERR;
-    }
-
-"""
+INTEGRITY_SIGN = f'static const char *SIGN = "{UPSTREAM_CERT_SHA1}";'
+INTEGRITY_SIGN_NEW = f'static const char *SIGN = "{FORK_CERT_SHA1}";'
 
 HIDDEN_OLD = """    val showHiddenFeature =
         addConfig(
@@ -142,8 +144,9 @@ def build_edits(app_id: str, label: str, version_code: str, version_name: str):
         # 显示名：launcher / 系统设置 / 最近任务都读 AppName
         (STRINGS, '<string name="AppName">Telegram</string>',
          f'<string name="AppName">{label}</string>', False),
-        # ── 自签包必须去掉签名校验，否则进程在 JNI_OnLoad 就返回 JNI_ERR（能装、一开即崩）
-        (JNIC, VERIFY_SIGN_OLD, "", False),
+        # ── 签名指纹换成我们自己的：JNI_OnLoad 里 verifySign 仍会跑，只是改认 Vstory 证书。
+        #    删调用也能让包起来，但那把「别人改包重签也拦不住」—— 防护白送。
+        (INTEGRITY, INTEGRITY_SIGN, INTEGRITY_SIGN_NEW, False),
         # ── 隐藏功能默认开启：否则 setCanNotChange() 会把强制复制那两行从列表里删掉
         (NACONFIG, HIDDEN_OLD, HIDDEN_NEW, False),
         # ── 长按一次直接弹调试菜单，且不再有「发生错误」提示

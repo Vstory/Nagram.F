@@ -5,8 +5,9 @@
 # ── 与母版（LSPosed 模块 / 普通 Flutter 应用）的差异，同步母版时注意保留 ──
 #   ① 构建单元是 `:TMessagesProj`（它自己 apply com.android.application），不是 :app
 #   ② 必须先编 native：`./run init libs` + `./run libs native`（NATIVE_TARGET 收窄到 arm64-v8a）
-#   ③ jni.c 里的 verifySign 闸门必须在**native 编译之前**删掉 —— 否则编出的 .so 仍带签名校验，
-#      自签包能装、一开即崩。故「改写」必须排在「native」之前，且 native 缓存只由本工作流产生
+#   ③ native 层钉着上游发布证书的 SHA1（integrity.cpp 的 SIGN 常量），自签包会 JNI_ERR，
+#      故必须在**native 编译之前**把这个常量换成 Vstory 证书的 SHA1（不是删掉 verifySign 调用 ——
+#      留着才拦得住别人改我们的包重签）。改写排在 native 之前，且 native 缓存只由本工作流产生
 #   ④ 版本号来自 gradle.properties 的 APP_VERSION_CODE / APP_VERSION_NAME（buildSrc 读它）
 #   ⑤ 签名读 TMessagesProj/release.keystore + local.properties 的 RELEASE_*（不是 AGP 的 storeFile）
 #   ⑥ 上游三个工作流（debug / pr / release）已从 fork 中删除 —— 见提交 ci: drop upstream workflows
@@ -135,9 +136,12 @@ jobs:
             --label "$FORK_LABEL" \
             --version-code "${{ steps.info.outputs.code }}" \
             --version-name "${{ steps.info.outputs.vn }}"
-          # 改写自检：闸门必须已经不在，否则自签包一开就崩
+          # 自检：校验调用必须还在（删掉就等于放行任何人改包重签），且已改认我们的证书
           grep -q "verifySign(env)" TMessagesProj/jni/jni.c \
-            && { echo "::error::jni.c 的 verifySign 闸门没被去掉"; exit 1; } || true
+            || { echo "::error::verifySign 调用不见了 —— 防重打包的闸门被删掉"; exit 1; }
+          grep -q 'SIGN = "92A37D7C19D696CA2645D00A11C507358805B2D6"' \
+            TMessagesProj/jni/integrity/integrity.cpp \
+            || { echo "::error::integrity.cpp 的 SIGN 没换成 Vstory 证书 SHA1"; exit 1; }
           grep -q "versionViewPressCount++" TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java \
             && { echo "::error::版本号长按的计数逻辑没被移除"; exit 1; } || true
 
