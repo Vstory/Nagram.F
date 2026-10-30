@@ -150,8 +150,14 @@ jobs:
           grep -q 'SIGN = "92A37D7C19D696CA2645D00A11C507358805B2D6"' \
             TMessagesProj/jni/integrity/integrity.cpp \
             || { echo "::error::integrity.cpp 的 SIGN 没换成 Vstory 证书 SHA1"; exit 1; }
-          grep -q "versionViewPressCount++" TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java \
-            && { echo "::error::版本号长按的计数逻辑没被移除"; exit 1; } || true
+          # 两个入口的「第 2 次才弹 + 发生错误提示」都必须已经不存在
+          grep -q 'getString(R.string.DebugMenuLongPress)' \
+            TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java \
+            && { echo "::error::设置页仍有「再长按一次」的拦截提示"; exit 1; } || true
+          grep -q 'pressCount >= 2' TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java \
+            && { echo "::error::资料页仍要求长按两次才弹菜单"; exit 1; } || true
+          grep -q 'ErrorOccurred' TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java \
+            && { echo "::warning::资料页版本行可能仍有「发生错误」提示，人工确认"; } || true
 
       # 固定密钥：解到 TMessagesProj/release.keystore（模块侧 storeFile 就是这个相对路径），
       #   口令经 local.properties 传给 buildSrc。缺 secret 直接失败，不回退 debug 签名 ——

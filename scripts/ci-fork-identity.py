@@ -12,8 +12,10 @@
   2. native 层签名指纹 —— 内置的是上游发布证书的 SHA1，自签包会 JNI_ERR；换成我们自己的证书
      SHA1 而不是删掉校验（删掉等于把「防重打包」也一起扔了，任何人都能改我们的包重签发布）
   3. 版本号（APP_VERSION_CODE / APP_VERSION_NAME，来源 gradle.properties）
-  4. 调试菜单：长按一次直接弹出（不再要求第 2 次），并去掉「发生错误」提示
-  5. 调试菜单硬编码英文条目汉化（语言包管不到字面量）
+  4. 调试菜单的两个入口（设置页 / 资料页长按版本行）：一次长按即弹出（不再要求第 2 次），
+     并去掉「发生错误」提示；第 5 次长按切换「显示隐藏功能」的原行为保留（那是用户自行开启
+     隐藏功能的唯一入口，CI 不代开、也不该把它拆掉）
+  5. 调试菜单硬编码英文条目汉化（语言包管不到字面量），两处菜单共用一张表
   （隐藏功能开关保持上游默认关闭，由用户在设置页自行开启 —— CI 不代劳）
 
 用法：
@@ -35,6 +37,7 @@ DEFAULT_APP_ID = "xyz.nextalone.nagram.fork"
 DEFAULT_LABEL = "Nagram.F"
 
 SETTINGS = "TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java"
+PROFILE = "TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java"
 JNIC = "TMessagesProj/jni/jni.c"
 INTEGRITY = "TMessagesProj/jni/integrity/integrity.cpp"
 # tokens/Signing/Vstory.jks 证书的 SHA1（大写无冒号）
@@ -111,9 +114,29 @@ LONG_PRESS_OLD = """        versionView.setOnLongClickListener(v -> {
         });"""
 
 LONG_PRESS_NEW = """        versionView.setOnLongClickListener(v -> {
+            versionViewPressCount++;
+            if (versionViewPressCount >= 5) {
+                NaConfig.INSTANCE.getShowHiddenFeature().toggleConfigBool();
+            }
             openDebugMenu();
             return true;
         });"""
+
+# 资料页版本行：同样的闸门（toast + 第 2 次门槛），菜单就地构建、没有独立方法
+PROFILE_PRESS_OLD = """                if (position == versionRow) {
+                    pressCount++;
+                    if (pressCount >= 5) {
+                        NaConfig.INSTANCE.getShowHiddenFeature().toggleConfigBool();
+                        Toast.makeText(getParentActivity(), LocaleController.getString("ErrorOccurred", R.string.ErrorOccurred), Toast.LENGTH_SHORT).show();
+                    }
+                    if (pressCount >= 2 || BuildVars.DEBUG_PRIVATE_VERSION) {"""
+
+PROFILE_PRESS_NEW = """                if (position == versionRow) {
+                    pressCount++;
+                    if (pressCount >= 5) {
+                        NaConfig.INSTANCE.getShowHiddenFeature().toggleConfigBool();
+                    }
+                    if (true) {"""
 
 INTEGRITY_SIGN = f'static const char *SIGN = "{UPSTREAM_CERT_SHA1}";'
 INTEGRITY_SIGN_NEW = f'static const char *SIGN = "{FORK_CERT_SHA1}";'
@@ -124,22 +147,24 @@ def build_edits(app_id: str, label: str, version_code: str, version_name: str):
     edits = [
         # ── 身份：只改 applicationId，不动 namespace（class 包名一变，manifest 的相对名就崩）
         (APP_GRADLE, f'defaultConfig.applicationId = "{UPSTREAM_APP_ID}"',
-         f'defaultConfig.applicationId = "{app_id}"', False),
+         f'defaultConfig.applicationId = "{app_id}"', False, False),
         # 显示名：launcher / 系统设置 / 最近任务都读 AppName
         (STRINGS, '<string name="AppName">Telegram</string>',
-         f'<string name="AppName">{label}</string>', False),
+         f'<string name="AppName">{label}</string>', False, False),
         # ── 签名指纹换成我们自己的：JNI_OnLoad 里 verifySign 仍会跑，只是改认 Vstory 证书。
         #    删调用也能让包起来，但那把「别人改包重签也拦不住」—— 防护白送。
-        (INTEGRITY, INTEGRITY_SIGN, INTEGRITY_SIGN_NEW, False),
+        (INTEGRITY, INTEGRITY_SIGN, INTEGRITY_SIGN_NEW, False, False),
         # ── 长按一次直接弹调试菜单，且不再有「发生错误」提示
-        (SETTINGS, LONG_PRESS_OLD, LONG_PRESS_NEW, False),
+        (SETTINGS, LONG_PRESS_OLD, LONG_PRESS_NEW, False, False),
+        (PROFILE, PROFILE_PRESS_OLD, PROFILE_PRESS_NEW, False, False),
         # ── 版本号
-        (GRADLE_PROPS, "APP_VERSION_CODE=7175", f"APP_VERSION_CODE={version_code}", False),
-        (GRADLE_PROPS, "APP_VERSION_NAME=13.0.2", f"APP_VERSION_NAME={version_name}", False),
+        (GRADLE_PROPS, "APP_VERSION_CODE=7175", f"APP_VERSION_CODE={version_code}", False, False),
+        (GRADLE_PROPS, "APP_VERSION_NAME=13.0.2", f"APP_VERSION_NAME={version_name}", False, False),
     ]
     # ── 调试菜单汉化：字面量可能出现在别处（如 SharedConfig 的提示），一律全量替换
     for en, zh in DEBUG_MENU_ZH.items():
-        edits.append((SETTINGS, f'"{en}"', f'"{zh}"', True))
+        for f in (SETTINGS, PROFILE):
+            edits.append((f, f'"{en}"', f'"{zh}"', True, True))
     return edits
 
 
@@ -148,7 +173,7 @@ def run(app_id: str, label: str, version_code: str, version_name: str, dry_run: 
     changed: dict[Path, str] = {}
     failures: list[str] = []
 
-    for rel, old, new, allow_multi in edits:
+    for rel, old, new, allow_multi, allow_missing in edits:
         path = REPO_ROOT / rel
         if path not in changed:
             if not path.is_file():
@@ -158,6 +183,8 @@ def run(app_id: str, label: str, version_code: str, version_name: str, dry_run: 
         text = changed[path]
         count = text.count(old)
         if count == 0:
+            if allow_missing:
+                continue
             failures.append(f"{rel}: 找不到原文（上游可能改过写法）→ {old.splitlines()[0][:80]!r}")
             continue
         if count > 1 and not allow_multi:
@@ -188,7 +215,7 @@ def selftest() -> int:
     if not edits:
         print("FAIL: 规则表为空")
         return 1
-    for rel, old, new, _ in edits:
+    for rel, old, new, *_ in edits:
         if old == new:
             print(f"FAIL: 规则新旧一致且为空操作 → {rel}: {old[:40]!r}")
             return 1
