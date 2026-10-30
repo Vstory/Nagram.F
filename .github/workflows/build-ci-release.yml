@@ -138,7 +138,7 @@ jobs:
           # 改写自检：闸门必须已经不在，否则自签包一开就崩
           grep -q "verifySign(env)" TMessagesProj/jni/jni.c \
             && { echo "::error::jni.c 的 verifySign 闸门没被去掉"; exit 1; } || true
-          grep -q "versionViewPressCount" TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java \
+          grep -q "versionViewPressCount++" TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java \
             && { echo "::error::版本号长按的计数逻辑没被移除"; exit 1; } || true
 
       # 固定密钥：解到 TMessagesProj/release.keystore（模块侧 storeFile 就是这个相对路径），
