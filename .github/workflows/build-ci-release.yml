@@ -1,0 +1,305 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Nagram.F 的 CI 出包：任意分支 push 即出包，每次构建发成一个**独立 tag 的预发布页**。
+#   Tag 形如 v13.0.2-r261030.0512.abcd1234 = 版本-r年月日.时分.短号（与 Kelivo.F / Mishka.F 同口径）。
+#   参考项目：Mishka.F（身份改写 + 门禁 + 一版一 Release）、Kelivo.F（版本号与 tag 命名）。
+# ── 与母版（LSPosed 模块 / 普通 Flutter 应用）的差异，同步母版时注意保留 ──
+#   ① 构建单元是 `:TMessagesProj`（它自己 apply com.android.application），不是 :app
+#   ② 必须先编 native：`./run init libs` + `./run libs native`（NATIVE_TARGET 收窄到 arm64-v8a）
+#   ③ jni.c 里的 verifySign 闸门必须在**native 编译之前**删掉 —— 否则编出的 .so 仍带签名校验，
+#      自签包能装、一开即崩。故「改写」必须排在「native」之前，且 native 缓存只由本工作流产生
+#   ④ 版本号来自 gradle.properties 的 APP_VERSION_CODE / APP_VERSION_NAME（buildSrc 读它）
+#   ⑤ 签名读 TMessagesProj/release.keystore + local.properties 的 RELEASE_*（不是 AGP 的 storeFile）
+#   ⑥ 上游三个工作流（debug / pr / release）已从 fork 中删除 —— 见提交 ci: drop upstream workflows
+# ── action 引用（规则：工程域/脚本编写规则流程.md §CI 工作流）──
+#   uses 一律钉完整 40 位 SHA，禁 @vN / @main；行尾留 `# vX.Y.Z`。
+#   当前定版：checkout v7.0.1 / setup-java v6.1.0 / cache v6.1.0 / upload-artifact v7.0.2
+# ══════════════════════════════════════════════════════════════════════════════
+name: Build · CI · Release
+run-name: "Build · CI · Release · Nagram.F · ${{ github.ref_name }}"
+
+on:
+  push:
+    # 必须显式写 branches：只写 paths-ignore 时标签推送也会触发。
+    branches: ['**']
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # 产物名前缀 = fork 显示名（进文件名与下载 URL ⇒ 只允许 A-Za-z0-9._-）
+  FORK_LABEL: Nagram.F
+  # fork 身份：与上游 xyz.nextalone.nagram 并存安装
+  EXPECT_PACKAGE: xyz.nextalone.nagram.fork
+  EXPECT_ABI: arm64-v8a
+  # 固定密钥的证书指纹（SHA-256 大写无冒号）
+  EXPECTED_CERT_SHA256: '8D1B6022D3E3BB837A3BA1870E0EEAC8650F9470B8287EDF549DACEC9E9E2A64'
+  # versionCode = 基数 + 运行序号：单调递增、与提交历史无关（squash/切分支都不会倒退）
+  VERSION_CODE_BASE: '5000'
+  JAVA_VERSION: '17'
+  ANDROID_PLATFORM: android-36
+  BUILD_TOOLS: 36.0.0
+  NDK_VERSION: 27.2.12479018
+  CMAKE_VERSION: 3.22.1
+  NATIVE_LIBS_DIR: TMessagesProj/src/main/libs/arm64-v8a
+  APK_DIR: TMessagesProj/build/outputs/apk/release
+
+jobs:
+  build:
+    # Nagram 的 native 全量编译在 4 核上约 40-90 分钟；缓存命中后只要 Gradle 那一段
+    runs-on: ubuntu-26.04
+    timeout-minutes: 300
+    env:
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: init.defaultBranch
+      GIT_CONFIG_VALUE_0: main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 子模块（ffmpeg / boringssl / td / tgcalls …）是 native 编译的前提，缺一即编不出来。
+          # fetch-depth: 1 —— 子模块历史对本项目无用，全量拉会白等十几分钟。
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # native 编译的本机工具链：cmake/ninja/yasm 缺一即在 configure 阶段报含糊错
+      - name: Install native toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            gcc g++ make cmake ninja-build yasm pkg-config python3 python3-pip zip unzip
+          cmake --version | head -1
+          ninja --version
+          yasm --version | head -1
+
+      - name: Set up Android SDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKM="$(command -v sdkmanager || echo "$SDK/cmdline-tools/latest/bin/sdkmanager")"
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          for pkg in "platforms;${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}" \
+                     "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"; do
+            "$SDKM" "$pkg" >/dev/null 2>&1 || sudo "$SDKM" "$pkg" >/dev/null 2>&1 \
+              || echo "::warning::$pkg 安装返回非零"
+          done
+          test -f "$SDK/platforms/${ANDROID_PLATFORM}/android.jar" \
+            || { echo "::error::platforms/${ANDROID_PLATFORM} 未就位"; exit 1; }
+          test -d "$SDK/ndk/${NDK_VERSION}" || { echo "::error::NDK ${NDK_VERSION} 未就位"; exit 1; }
+          test -x "$SDK/build-tools/${BUILD_TOOLS}/aapt2" || { echo "::error::build-tools 未就位"; exit 1; }
+          {
+            echo "sdk.dir=$SDK"
+            echo "ndk.dir=$SDK/ndk/${NDK_VERSION}"
+          } >> local.properties
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      - name: Compute build info
+        id: info
+        run: |
+          set -euo pipefail
+          VER="$(sed -nE 's/^APP_VERSION_NAME=([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' gradle.properties | head -1)"
+          [ -n "$VER" ] || { echo "::error::读不到 gradle.properties 的 APP_VERSION_NAME"; exit 1; }
+          SHORT="${GITHUB_SHA:0:8}"
+          CODE="$(( VERSION_CODE_BASE + GITHUB_RUN_NUMBER ))"
+          TS="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)"
+          STAMP="${TS:2:6}-${TS##*-}"
+          VN="${VER}+ci.${SHORT}"
+          {
+            echo "ver=$VER"
+            echo "code=$CODE"
+            echo "short=$SHORT"
+            echo "stamp=$STAMP"
+            echo "vn=$VN"
+            echo "tag=v${VER}-r${STAMP//-/.}.${SHORT}"
+            echo "commit=$GITHUB_SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "APK_NAME=${FORK_LABEL}_${VER}.ci.${SHORT}_${STAMP}_ci-release_${SHORT}.apk" >> "$GITHUB_ENV"
+          echo "版本 ${VN}（versionCode ${CODE}）→ tag v${VER}-r${STAMP//-/.}.${SHORT}"
+
+      # ⚠️ 必须排在 native 之前：jni.c 的 verifySign 编进 .so 后无法在应用层补救
+      - name: Apply fork identity (workspace only, not committed)
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-fork-identity.py \
+            --app-id "$EXPECT_PACKAGE" \
+            --label "$FORK_LABEL" \
+            --version-code "${{ steps.info.outputs.code }}" \
+            --version-name "${{ steps.info.outputs.vn }}"
+          # 改写自检：闸门必须已经不在，否则自签包一开就崩
+          grep -q "verifySign(env)" TMessagesProj/jni/jni.c \
+            && { echo "::error::jni.c 的 verifySign 闸门没被去掉"; exit 1; } || true
+          grep -q "versionViewPressCount" TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java \
+            && { echo "::error::版本号长按的计数逻辑没被移除"; exit 1; } || true
+
+      # 固定密钥：解到 TMessagesProj/release.keystore（模块侧 storeFile 就是这个相对路径），
+      #   口令经 local.properties 传给 buildSrc。缺 secret 直接失败，不回退 debug 签名 ——
+      #   「构建成功、签名不对」要等覆盖安装时才发现。
+      - name: Prepare signing
+        env:
+          KEY_BASE64: ${{ secrets.KEY_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in KEY_BASE64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          [ -z "$missing" ] || { echo "::error::缺少签名 secret:$missing"; exit 1; }
+
+          KS="$GITHUB_WORKSPACE/TMessagesProj/release.keystore"
+          printf '%s' "$KEY_BASE64" | base64 -d > "$KS"
+          keytool -list -keystore "$KS" -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" >/dev/null 2>&1 \
+            || { echo "::error::密钥库打不开或别名不存在"; exit 1; }
+
+          # buildSrc 从 local.properties 读这三个；gradle.properties 里的占位值（android/androidkey）
+          # 一并覆盖成同一组，避免两处来源打架。
+          {
+            printf 'RELEASE_STORE_PASSWORD=%s\n' "$STORE_PASSWORD"
+            printf 'RELEASE_KEY_ALIAS=%s\n' "$KEY_ALIAS"
+            printf 'RELEASE_KEY_PASSWORD=%s\n' "$KEY_PASSWORD"
+          } >> local.properties
+          sed -i \
+            -e "s|^RELEASE_STORE_PASSWORD=.*|RELEASE_STORE_PASSWORD=${STORE_PASSWORD}|" \
+            -e "s|^RELEASE_KEY_ALIAS=.*|RELEASE_KEY_ALIAS=${KEY_ALIAS}|" \
+            -e "s|^RELEASE_KEY_PASSWORD=.*|RELEASE_KEY_PASSWORD=${KEY_PASSWORD}|" \
+            gradle.properties
+          echo "已按固定密钥配置签名"
+
+      # native 产物缓存：命中即跳过 40-90 分钟的编译。
+      #   ⚠️ key 里带 noverifysign 标记 —— 缓存里的 .so 只能来自「已去掉签名校验」的源码，
+      #      否则命中旧缓存等于把闸门又带回来（应用图标能点开、进程立刻退出）。
+      - name: Restore native cache
+        id: native-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NATIVE_LIBS_DIR }}
+          key: native-noverifysign-${{ runner.os }}-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'TMessagesProj/jni/CMakeLists.txt', 'TMessagesProj/jni/Application.mk') }}
+
+      - name: Build native libs
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        env:
+          NATIVE_TARGET: arm64-v8a
+        run: |
+          set -euo pipefail
+          chmod +x run
+          ./run init libs
+          ./run libs native
+          test -d "$NATIVE_LIBS_DIR" || { echo "::error::native 产物目录不存在"; exit 1; }
+          ls -la "$NATIVE_LIBS_DIR" | head
+
+      - name: Gradle cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Gradle build
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon :TMessagesProj:assembleRelease
+          ls -la "$APK_DIR" || true
+
+      - name: Rename APK
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          UNSIGNED=("$APK_DIR"/*unsigned*.apk)
+          [ "${#UNSIGNED[@]}" -eq 0 ] \
+            || { echo "::error::产物未签名（${UNSIGNED[*]}）—— signingConfig 没生效"; exit 1; }
+          APKS=("$APK_DIR"/*.apk)
+          [ "${#APKS[@]}" -eq 1 ] \
+            || { echo "::error::$APK_DIR 里应恰好 1 个 apk，实际 ${#APKS[@]} 个"; exit 1; }
+          mkdir -p dist
+          cp -- "${APKS[0]}" "dist/${APK_NAME}"
+          echo "产物: dist/${APK_NAME} ← ${APKS[0]}"
+          ls -la dist
+
+      # 门禁：包名 / 显示名 / 版本号 / 单 ABI / 核心 so / 签名指纹。全是「装得上、跑不对」的静默失败，
+      #   必须做成断言而不是发布前看一眼。
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          AAPT2="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)"
+          APKSIGNER="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)"
+          [ -n "$AAPT2" ] || { echo "::error::找不到 aapt2"; exit 1; }
+          [ -n "$APKSIGNER" ] || { echo "::error::找不到 apksigner"; exit 1; }
+
+          APK="dist/${APK_NAME}"
+          BADGING="$("$AAPT2" dump badging "$APK" 2>/dev/null || true)"
+          PKG_LINE="$(printf '%s' "$BADGING" | grep -m1 "^package:" || true)"
+          [ -n "$PKG_LINE" ] || { echo "::error::读不到 badging 的 package 行"; exit 1; }
+
+          printf '%s' "$PKG_LINE" | grep -Fq "name='${EXPECT_PACKAGE}'" \
+            || { echo "::error::包名不是 ${EXPECT_PACKAGE}：$PKG_LINE"; exit 1; }
+          printf '%s' "$BADGING" | grep -m1 "^application-label:" | grep -Fq "'${FORK_LABEL}'" \
+            || { echo "::error::显示名不是 ${FORK_LABEL}"; exit 1; }
+          printf '%s' "$PKG_LINE" | grep -Fq "versionCode='${{ steps.info.outputs.code }}'" \
+            || { echo "::error::versionCode 不符：$PKG_LINE"; exit 1; }
+          printf '%s' "$PKG_LINE" | grep -Fq "versionName='${{ steps.info.outputs.vn }}'" \
+            || { echo "::error::versionName 不符：$PKG_LINE"; exit 1; }
+          NC="$(printf '%s' "$BADGING" | grep -m1 "^native-code:" || true)"
+          [ "$NC" = "native-code: '${EXPECT_ABI}'" ] \
+            || { echo "::error::native-code 不是单一 ${EXPECT_ABI}：${NC:-未读到}"; exit 1; }
+          # 主 so：libtmessages.<n>.so 由 bin/libs/native.sh 从 merged_native_libs 拷进
+          #   src/main/libs/<abi>，是「native 编过且被打进包」的唯一硬证据（缺了应用一开就崩）
+          unzip -l "$APK" | grep -qE "lib/${EXPECT_ABI}/libtmessages\.[0-9]+\.so$" \
+            || { echo "::error::包里缺 lib/${EXPECT_ABI}/libtmessages.*.so（native 没编或没打进包）"; exit 1; }
+          echo "  ✅ 主 so 就位"
+
+          OUT="$("$APKSIGNER" verify --print-certs "$APK" 2>&1 || true)"
+          printf '%s' "$OUT" | grep -qi 'DOES NOT VERIFY\|no signature' \
+            && { echo "::error::签名校验失败"; printf '%s\n' "$OUT"; exit 1; } || true
+          DIGEST="$(printf '%s' "$OUT" | sed -nE 's/^.*certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' | head -1)"
+          [ -n "$DIGEST" ] || { echo "::error::读不到签名指纹"; exit 1; }
+          ACTUAL="$(printf '%s' "$DIGEST" | tr -d ':' | tr 'a-f' 'A-F')"
+          [ "$ACTUAL" = "$EXPECTED_CERT_SHA256" ] \
+            || { echo "::error::签名指纹不符（期望 $EXPECTED_CERT_SHA256，实际 $ACTUAL）"; exit 1; }
+          echo "✅ 包名 $EXPECT_PACKAGE / 显示名 $FORK_LABEL / ${EXPECT_ABI} / 指纹 $ACTUAL"
+
+      # 每次构建发一个独立 tag 的预发布页；同 tag 重跑走 edit + clobber 覆盖。
+      # ⚠️ 不给 asset 写 label —— GitHub 会用 label 顶替文件名显示。
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.info.outputs.tag }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ steps.info.outputs.commit }}
+          SHORT: ${{ steps.info.outputs.short }}
+          BRANCH: ${{ github.ref_name }}
+          VER: ${{ steps.info.outputs.ver }}
+          CODE: ${{ steps.info.outputs.code }}
+        run: |
+          set -euo pipefail
+          NOTES="**Commit** [\`${SHORT}\`](https://github.com/${REPO}/commit/${COMMIT}) · **Branch** \`${BRANCH}\` · **Version** ${VER} (versionCode ${CODE}) · **ABI** ${EXPECT_ABI}"
+          if gh release view "$TARGET_TAG" >/dev/null 2>&1; then
+            gh release edit "$TARGET_TAG" --notes "$NOTES" --prerelease --latest=false
+          else
+            jq -n --arg t "$TARGET_TAG" --arg b "$NOTES" --arg c "$COMMIT" \
+              '{tag_name:$t, name:$t, target_commitish:$c, body:$b, prerelease:true}' \
+            | gh api -X POST "/repos/${REPO}/releases" --input -
+          fi
+          gh release upload "$TARGET_TAG" "dist/${APK_NAME}" --clobber
+          echo "已发布：https://github.com/${REPO}/releases/tag/${TARGET_TAG}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.FORK_LABEL }}-ci-release-${{ steps.info.outputs.stamp }}-${{ steps.info.outputs.short }}-${{ github.run_number }}
+          path: dist/*.apk
+          if-no-files-found: error
