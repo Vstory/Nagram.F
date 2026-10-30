@@ -12,10 +12,9 @@
   2. native 层签名指纹 —— 内置的是上游发布证书的 SHA1，自签包会 JNI_ERR；换成我们自己的证书
      SHA1 而不是删掉校验（删掉等于把「防重打包」也一起扔了，任何人都能改我们的包重签发布）
   3. 版本号（APP_VERSION_CODE / APP_VERSION_NAME，来源 gradle.properties）
-  4. 隐藏功能默认开启（否则「强制复制」那两行在设置页根本不存在）
-  5. 调试菜单：长按一次直接弹出（不再要求第 2 次），并去掉「发生错误」提示
-  6. 调试菜单硬编码英文条目汉化（语言包管不到字面量）
-  7. 签名校验（产物门禁在 workflow 侧，本脚本只改写源码）
+  4. 调试菜单：长按一次直接弹出（不再要求第 2 次），并去掉「发生错误」提示
+  5. 调试菜单硬编码英文条目汉化（语言包管不到字面量）
+  （隐藏功能开关保持上游默认关闭，由用户在设置页自行开启 —— CI 不代劳）
 
 用法：
     python3 scripts/ci-fork-identity.py --version-code 5001 --version-name 13.0.2+ci.abc12345
@@ -36,7 +35,6 @@ DEFAULT_APP_ID = "xyz.nextalone.nagram.fork"
 DEFAULT_LABEL = "Nagram.F"
 
 SETTINGS = "TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java"
-NACONFIG = "TMessagesProj/src/main/kotlin/xyz/nextalone/nagram/NaConfig.kt"
 JNIC = "TMessagesProj/jni/jni.c"
 INTEGRITY = "TMessagesProj/jni/integrity/integrity.cpp"
 # tokens/Signing/Vstory.jks 证书的 SHA1（大写无冒号）
@@ -120,20 +118,6 @@ LONG_PRESS_NEW = """        versionView.setOnLongClickListener(v -> {
 INTEGRITY_SIGN = f'static const char *SIGN = "{UPSTREAM_CERT_SHA1}";'
 INTEGRITY_SIGN_NEW = f'static const char *SIGN = "{FORK_CERT_SHA1}";'
 
-HIDDEN_OLD = """    val showHiddenFeature =
-        addConfig(
-            "ShowHiddenFeature",
-            ConfigItem.configTypeBool,
-            false
-        )"""
-
-HIDDEN_NEW = """    val showHiddenFeature =
-        addConfig(
-            "ShowHiddenFeature",
-            ConfigItem.configTypeBool,
-            true
-        )"""
-
 
 def build_edits(app_id: str, label: str, version_code: str, version_name: str):
     """返回 [(相对路径, 期望原文, 改写后, 是否允许多次出现)]。"""
@@ -147,8 +131,6 @@ def build_edits(app_id: str, label: str, version_code: str, version_name: str):
         # ── 签名指纹换成我们自己的：JNI_OnLoad 里 verifySign 仍会跑，只是改认 Vstory 证书。
         #    删调用也能让包起来，但那把「别人改包重签也拦不住」—— 防护白送。
         (INTEGRITY, INTEGRITY_SIGN, INTEGRITY_SIGN_NEW, False),
-        # ── 隐藏功能默认开启：否则 setCanNotChange() 会把强制复制那两行从列表里删掉
-        (NACONFIG, HIDDEN_OLD, HIDDEN_NEW, False),
         # ── 长按一次直接弹调试菜单，且不再有「发生错误」提示
         (SETTINGS, LONG_PRESS_OLD, LONG_PRESS_NEW, False),
         # ── 版本号
