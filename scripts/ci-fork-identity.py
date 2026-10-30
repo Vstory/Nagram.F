@@ -8,7 +8,8 @@
 上去还是上游那个应用）。
 
 改七类：
-  1. 包名 / 显示名（与上游原版并存安装）
+  1. 包名 / 显示名（与上游原版并存安装）+ google-services.json 里的 package_name
+     —— 不改它，:processReleaseGoogleServices 会因「找不到匹配 client」直接失败
   2. native 层签名指纹 —— 内置的是上游发布证书的 SHA1，自签包会 JNI_ERR；换成我们自己的证书
      SHA1 而不是删掉校验（删掉等于把「防重打包」也一起扔了，任何人都能改我们的包重签发布）
   3. 版本号（APP_VERSION_CODE / APP_VERSION_NAME，来源 gradle.properties）
@@ -40,6 +41,7 @@ SETTINGS = "TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java"
 PROFILE = "TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java"
 JNIC = "TMessagesProj/jni/jni.c"
 INTEGRITY = "TMessagesProj/jni/integrity/integrity.cpp"
+GMS = "TMessagesProj/google-services.json"
 # tokens/Signing/Vstory.jks 证书的 SHA1（大写无冒号）
 FORK_CERT_SHA1 = "92A37D7C19D696CA2645D00A11C507358805B2D6"
 UPSTREAM_CERT_SHA1 = "3A0F57FE06485D0B90D0ACD990E3A30328E3988D"
@@ -148,6 +150,10 @@ def build_edits(app_id: str, label: str, version_code: str, version_name: str):
         # ── 身份：只改 applicationId，不动 namespace（class 包名一变，manifest 的相对名就崩）
         (APP_GRADLE, f'defaultConfig.applicationId = "{UPSTREAM_APP_ID}"',
          f'defaultConfig.applicationId = "{app_id}"', False, False),
+        # FCM 配置里的包名必须与 applicationId 一致，否则 google-services 插件在
+        #   processReleaseGoogleServices 阶段报 No matching client 并中断构建。
+        #   ⚠️ 这只让构建过；真要用推送得在 Firebase 里为 fork 包名建项目并换整份 json。
+        (GMS, f'"package_name": "{UPSTREAM_APP_ID}"', f'"package_name": "{app_id}"', False, False),
         # 显示名：launcher / 系统设置 / 最近任务都读 AppName
         (STRINGS, '<string name="AppName">Telegram</string>',
          f'<string name="AppName">{label}</string>', False, False),
