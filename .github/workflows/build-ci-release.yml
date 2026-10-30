@@ -181,19 +181,16 @@ jobs:
           keytool -list -keystore "$KS" -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" >/dev/null 2>&1 \
             || { echo "::error::密钥库打不开或别名不存在"; exit 1; }
 
-          # buildSrc 从 local.properties 读这三个；gradle.properties 里的占位值（android/androidkey）
-          # 一并覆盖成同一组，避免两处来源打架。
+          # 口令走环境变量而不是 local.properties：TMessagesProj/build.gradle 用
+          #   java.util.Properties.load() 解析它，值里的反斜杠会被当转义符吃掉，
+          #   而这里的口令是 48 位随机串、无法保证不含特殊字符。环境变量（KEYSTORE_PASS /
+          #   ALIAS_NAME / ALIAS_PASS）是它认的第二个来源，读不到 local.properties 的值时才回落。
           {
-            printf 'RELEASE_STORE_PASSWORD=%s\n' "$STORE_PASSWORD"
-            printf 'RELEASE_KEY_ALIAS=%s\n' "$KEY_ALIAS"
-            printf 'RELEASE_KEY_PASSWORD=%s\n' "$KEY_PASSWORD"
-          } >> local.properties
-          sed -i \
-            -e "s|^RELEASE_STORE_PASSWORD=.*|RELEASE_STORE_PASSWORD=${STORE_PASSWORD}|" \
-            -e "s|^RELEASE_KEY_ALIAS=.*|RELEASE_KEY_ALIAS=${KEY_ALIAS}|" \
-            -e "s|^RELEASE_KEY_PASSWORD=.*|RELEASE_KEY_PASSWORD=${KEY_PASSWORD}|" \
-            gradle.properties
-          echo "已按固定密钥配置签名"
+            printf 'KEYSTORE_PASS=%s\n' "$STORE_PASSWORD"
+            printf 'ALIAS_NAME=%s\n' "$KEY_ALIAS"
+            printf 'ALIAS_PASS=%s\n' "$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "已按固定密钥配置签名（环境变量）"
 
       # native 产物缓存：命中即跳过 40-90 分钟的编译。
       #   ⚠️ key 里带 noverifysign 标记 —— 缓存里的 .so 只能来自「已去掉签名校验」的源码，
